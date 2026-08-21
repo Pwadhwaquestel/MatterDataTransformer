@@ -158,6 +158,25 @@ def split_multiselect(raw_value, separator):
     return [t.strip() for t in raw_value.split(separator) if t.strip()]
 
 
+# Fields the importer expects as semicolon-separated with no surrounding spaces
+# when there are multiple values (e.g. "A1;A2"), single value passes through as-is.
+MULTI_VALUE_COLUMNS = {"applicants", "inventors"}
+
+
+def normalize_multi_value(raw_value):
+    raw_value = (raw_value or "").strip()
+    if not raw_value:
+        return ""
+    if ";" in raw_value:
+        parts = raw_value.split(";")
+    elif "," in raw_value:
+        parts = raw_value.split(",")
+    else:
+        return raw_value
+    parts = [p.strip() for p in parts if p.strip()]
+    return ";".join(parts)
+
+
 def load_raw_file(uploaded_file):
     name = uploaded_file.name.lower()
     data = uploaded_file.getvalue()
@@ -355,7 +374,10 @@ with st.expander("Optional fields", expanded=False):
     ocols = st.columns(3)
     for i, target_col in enumerate(optional_cols):
         with ocols[i % 3]:
-            st.markdown(f"`{target_col}` <span class='stamp-opt'>optional</span>", unsafe_allow_html=True)
+            stamp = "<span class='stamp-opt'>optional</span>"
+            if target_col in MULTI_VALUE_COLUMNS:
+                stamp += " <span style='font-size:11px;color:#5B5F66;'>(auto -> semicolon-separated)</span>"
+            st.markdown(f"`{target_col}` {stamp}", unsafe_allow_html=True)
             sel = st.selectbox(target_col, [SKIP] + src_columns, key=f"map_{target_col}", label_visibility="collapsed")
             col_map[target_col] = None if sel == SKIP else sel
 
@@ -595,7 +617,10 @@ if st.button("Save & Validate", type="primary"):
                 out[target_col] = subcategory_value_map.get(row[subcategory_src], "") if subcategory_src else ""
             else:
                 src_col = col_map.get(target_col)
-                out[target_col] = row[src_col] if src_col else ""
+                val = row[src_col] if src_col else ""
+                if target_col in MULTI_VALUE_COLUMNS:
+                    val = normalize_multi_value(val)
+                out[target_col] = val
 
         # Custom fields
         for field in custom_field_defs:
