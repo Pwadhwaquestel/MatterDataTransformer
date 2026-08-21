@@ -117,6 +117,47 @@ def code_from_option(option):
     return option.split(" - ", 1)[0].strip()
 
 
+SEPARATOR_CHOICES = [",", ";", "|", "Other (specify)"]
+
+
+def group_custom_fields(raw_list, entity_type="matter"):
+    """
+    Groups the flat custom-fields export (one row per field, or one row per
+    field+option for select/multiselect) into one entry per field_id.
+
+    Returns a list of dicts, sorted by field_id:
+      {"field_id": "8069", "field_name": "Budget", "field_type": "select",
+       "options": ["Tau-MAB", "Mor-Tau", ...]}
+    """
+    fields = {}
+    for entry in raw_list:
+        et = str(entry.get("entity_type", "")).strip().lower()
+        if et != entity_type.lower():
+            continue
+        fid = entry.get("mcso.field_id", entry.get("field_id"))
+        if fid is None:
+            continue
+        fid = str(fid).strip()
+        ftype = str(entry.get("field_type", "")).strip().lower()
+        fname = str(entry.get("field_name", "")).strip()
+        if fid not in fields:
+            fields[fid] = {"field_id": fid, "field_name": fname, "field_type": ftype, "options": []}
+        opt = entry.get("options")
+        # Only Python None (JSON null) means "no option" - a literal string
+        # value like "None" is a real selectable option and must be kept.
+        if opt is not None and str(opt).strip() != "":
+            opt_s = str(opt).strip()
+            if opt_s not in fields[fid]["options"]:
+                fields[fid]["options"].append(opt_s)
+    return sorted(fields.values(), key=lambda f: int(f["field_id"]) if f["field_id"].isdigit() else f["field_id"])
+
+
+def split_multiselect(raw_value, separator):
+    if not raw_value:
+        return []
+    return [t.strip() for t in raw_value.split(separator) if t.strip()]
+
+
 def load_raw_file(uploaded_file):
     name = uploaded_file.name.lower()
     data = uploaded_file.getvalue()
@@ -227,8 +268,13 @@ with c2:
 with c3:
     raw_file = st.file_uploader("Raw source file", type=["csv", "xlsx", "xls"])
 
+custom_fields_file = st.file_uploader(
+    "Custom Fields JSON (optional - only needed if this client has custom fields to map)",
+    type=["json"], key="custom_fields_upload",
+)
+
 if not (orgid and dropdown_file and country_json_file and raw_file):
-    st.info("Enter the Org ID and upload all three files to continue.")
+    st.info("Enter the Org ID and upload the required files to continue.")
     st.stop()
 
 try:
@@ -244,6 +290,15 @@ except Exception as e:
     st.error(f"Failed to parse country codes JSON: {e}")
     st.stop()
 
+custom_field_defs = []
+if custom_fields_file:
+    try:
+        raw_cf = load_json_list(custom_fields_file)
+        custom_field_defs = group_custom_fields(raw_cf, entity_type="matter")
+    except Exception as e:
+        st.error(f"Failed to parse custom fields JSON: {e}")
+        st.stop()
+
 try:
     df = load_raw_file(raw_file)
 except Exception as e:
@@ -252,7 +307,7 @@ except Exception as e:
 
 st.success(
     f"Loaded {len(dropdown)} dropdown entries, {len(country_options)} country codes, "
-    f"and {len(df)} raw rows ({len(df.columns)} columns)."
+    f"{len(custom_field_defs)} custom fields, and {len(df)} raw rows ({len(df.columns)} columns)."
 )
 src_columns = list(df.columns)
 
@@ -422,9 +477,106 @@ if trademark_present:
 st.divider()
 
 # ----------------------------------------------------------------------
-# Step 4: Save & Validate
+# Step 4: Custom Fields (optional)
 # ----------------------------------------------------------------------
-st.markdown('<div class="section-label">Step 4 - Save & Validate</div>', unsafe_allow_html=True)
+cf_src_map = {}            # field_id -> source column (or None)
+cf_value_maps = {}         # field_id -> {raw_value: mapped_value}  (select / checkbox)
+cf_multiselect_config = {} # field_id -> {"separator": str, "token_map": {raw_token: mapped_option}}
+cf_extra_date_columns = [] # cf_<id> columns that need YYYY-MM-DD validation
+
+if custom_field_defs:
+    st.markdown('<div class="section-label">Step 4 - Map Custom Fields (optional)</div>', unsafe_allow_html=True)
+    st.caption("Every custom field is optional. Skip any you don't need for this migration.")
+
+    for field in custom_field_defs:
+        fid = field["field_id"]
+        fname = field["field_name"]
+        ftype = field["field_type"]
+        options = field["options"]
+
+        with st.expander(f"cf_{fid} - {fname}  ({ftype})"):
+            sel = st.selectbox(
+                f"Source column for '{fname}'", [SKIP] + src_columns, key=f"cf_src_{fid}"
+            )
+            src = None if sel == SKIP else sel
+            cf_src_map[fid] = src
+            if not src:
+                continue
+
+            if ftype in ("text", "text_area"):
+                st.caption("Raw value copied as-is.")
+
+            elif ftype == "date":
+                st.caption("Raw value will be normalized to YYYY-MM-DD.")
+                cf_extra_date_columns.append(f"cf_{fid}")
+
+            elif ftype == "select":
+                if not options:
+                    st.warning("No options defined for this field in the JSON - values will be left blank.")
+                else:
+                    uniq = unique_values(df, src)
+                    vmap = {}
+                    vcols = st.columns(3)
+                    for i, val in enumerate(uniq):
+                        with vcols[i % 3]:
+                            if val == "":
+                                vmap[val] = ""
+                                continue
+                            choice = st.selectbox(f"`{val}` ->", [SKIP] + options, key=f"cfselect_{fid}_{val}")
+                            vmap[val] = "" if choice == SKIP else choice
+                    cf_value_maps[fid] = vmap
+
+            elif ftype == "checkbox":
+                st.caption("Map each raw value to 0 (unchecked) or 1 (checked).")
+                uniq = unique_values(df, src)
+                vmap = {}
+                vcols = st.columns(3)
+                for i, val in enumerate(uniq):
+                    with vcols[i % 3]:
+                        if val == "":
+                            vmap[val] = ""
+                            continue
+                        choice = st.selectbox(f"`{val}` ->", [SKIP, "0", "1"], key=f"cfcheck_{fid}_{val}")
+                        vmap[val] = "" if choice == SKIP else choice
+                cf_value_maps[fid] = vmap
+
+            elif ftype == "multiselect":
+                if not options:
+                    st.warning("No options defined for this field in the JSON - values will be left blank.")
+                else:
+                    sep_choice = st.selectbox(
+                        "Separator used for multiple picks in the raw file",
+                        SEPARATOR_CHOICES, key=f"cfsep_{fid}",
+                    )
+                    if sep_choice == "Other (specify)":
+                        sep = st.text_input("Enter the exact separator", key=f"cfsepcustom_{fid}") or ";"
+                    else:
+                        sep = sep_choice
+
+                    raw_vals = unique_values(df, src)
+                    tokens = sorted({t for v in raw_vals for t in split_multiselect(v, sep)})
+                    tmap = {}
+                    tcols = st.columns(3)
+                    for i, tok in enumerate(tokens):
+                        with tcols[i % 3]:
+                            choice = st.selectbox(f"`{tok}` ->", [SKIP] + options, key=f"cfms_{fid}_{tok}")
+                            tmap[tok] = "" if choice == SKIP else choice
+                    st.caption("Output is always semicolon-separated, e.g. Red;Blue")
+                    cf_multiselect_config[fid] = {"separator": sep, "token_map": tmap}
+
+            else:
+                st.caption(f"Unrecognized field type '{ftype}' - raw value copied as-is.")
+
+    st.divider()
+
+CUSTOM_FIELD_COLUMNS = [f"cf_{f['field_id']}" for f in custom_field_defs]
+FULL_TEMPLATE_COLUMNS = TEMPLATE_COLUMNS + CUSTOM_FIELD_COLUMNS
+ALL_DATE_COLUMNS = DATE_COLUMNS + cf_extra_date_columns
+
+# ----------------------------------------------------------------------
+# Step 5: Save & Validate
+# ----------------------------------------------------------------------
+st.markdown('<div class="section-label">Step 5 - Save & Validate</div>', unsafe_allow_html=True)
 
 if st.button("Save & Validate", type="primary"):
     output_rows = []
@@ -444,6 +596,35 @@ if st.button("Save & Validate", type="primary"):
             else:
                 src_col = col_map.get(target_col)
                 out[target_col] = row[src_col] if src_col else ""
+
+        # Custom fields
+        for field in custom_field_defs:
+            fid = field["field_id"]
+            ftype = field["field_type"]
+            col_name = f"cf_{fid}"
+            src = cf_src_map.get(fid)
+            if not src:
+                out[col_name] = ""
+                continue
+            raw_val = row[src]
+            if ftype in ("text", "text_area", "date"):
+                out[col_name] = raw_val  # date gets normalized in validation pass below
+            elif ftype == "select":
+                out[col_name] = cf_value_maps.get(fid, {}).get(raw_val, "")
+            elif ftype == "checkbox":
+                out[col_name] = cf_value_maps.get(fid, {}).get(raw_val, "")
+            elif ftype == "multiselect":
+                cfg = cf_multiselect_config.get(fid)
+                if cfg and raw_val:
+                    toks = split_multiselect(raw_val, cfg["separator"])
+                    mapped = [cfg["token_map"].get(t, "") for t in toks]
+                    mapped = [m for m in mapped if m]
+                    out[col_name] = ";".join(mapped)
+                else:
+                    out[col_name] = ""
+            else:
+                out[col_name] = raw_val
+
         output_rows.append(out)
 
     errors = []
@@ -462,7 +643,7 @@ if st.button("Save & Validate", type="primary"):
             else:
                 seen_mattercodes[mc] = idx
 
-        for date_col in DATE_COLUMNS:
+        for date_col in ALL_DATE_COLUMNS:
             val = out.get(date_col, "")
             if val == "":
                 continue
@@ -481,7 +662,7 @@ if st.button("Save & Validate", type="primary"):
 
     if not errors:
         buf = io.StringIO()
-        writer = csv.DictWriter(buf, fieldnames=TEMPLATE_COLUMNS)
+        writer = csv.DictWriter(buf, fieldnames=FULL_TEMPLATE_COLUMNS)
         writer.writeheader()
         for out in output_rows:
             writer.writerow(out)
